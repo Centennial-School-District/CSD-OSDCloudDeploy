@@ -1,7 +1,7 @@
 <#PSScriptInfo
 .VERSION 26.01.20
 .GUID 6f1ad863-b4de-4272-93b5-4aff0b4eb00a
-.AUTHOR David Segura @OSDeploy
+.AUTHOR David Segura @OSDeploy + Anand Singh @ CSD
 .COMPANYNAME Recast Software
 .COPYRIGHT (c) 2026 David Segura | Recast Software. All rights reserved.
 .TAGS OSDeploy OSDCloud WinPE OOBE Windows AutoPilot
@@ -232,7 +232,63 @@ if ($deploymentPhase -eq 'WinPE') {
     $TotalSeconds = [math]::Round(($EndTime - $StartTime).TotalSeconds, 2)
     Write-Host -ForegroundColor DarkGray "[i] Finished in $TotalSeconds seconds"
     $null = Stop-Transcript -ErrorAction Ignore
-    Deploy-OSDCloud -OperatingSystem 'Windows 11 26H2' -OSEdition 'Education' -OSActivation 'Volume' -OSLanguageCode 'en-us' -Force
+    #================================================
+    #   Deploy Windows (unattended)
+    #   -CLI skips the GUI, -Force skips the disk-clearing confirmation,
+    #   -PostAction Quit returns here so Autopilot.cmd can be written before reboot.
+    #   With -CLI, Deploy-OSDCloud throws on failure, so catch it and exit non-zero.
+    #================================================
+    try {
+        Deploy-OSDCloud -CLI -Force -PostAction Quit `
+            -OperatingSystem 'Windows 11 26H2' `
+            -OSEdition 'Education' `
+            -OSActivation 'Volume' `
+            -OSLanguageCode 'en-us'
+    }
+    catch {
+        Write-Host -ForegroundColor Red "[!] Deploy-OSDCloud failed: $($_.Exception.Message)"
+        exit 1
+    }
+
+    if ($global:OSDCloudResults.Status -ne 'Completed') {
+        Write-Host -ForegroundColor Red "[!] OSDCloud deployment did not complete (Status: $($global:OSDCloudResults.Status)). Skipping Autopilot.cmd"
+        exit 1
+    }
+    if (-not (Test-Path -Path 'C:\Windows\System32' -PathType Container)) {
+        Write-Host -ForegroundColor Red "[!] C:\Windows was not found after deployment. Skipping Autopilot.cmd"
+        exit 1
+    }
+
+    #================================================
+    #   Set AutopilotOOBE CMD on Deployed OS
+    #================================================
+    $SetCommand = @'
+@echo off
+
+:: Set the PowerShell Execution Policy
+PowerShell -NoL -Com Set-ExecutionPolicy RemoteSigned -Force
+
+:: Add PowerShell Scripts to the Path
+set path=%path%;C:\Program Files\WindowsPowerShell\Scripts
+
+:: Open and Minimize a PowerShell instance just in case
+start PowerShell -NoL -W Mi
+
+:: Install NuGet provider silently so Install-Module does not hang in OOBE
+PowerShell -NoL -Com "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue | Out-Null"
+
+:: Install the latest AutopilotOOBE Module
+start "Install-Module AutopilotOOBE" /wait PowerShell -NoL -C Install-Module -Name AutopilotOOBE -Force -Verbose
+
+:: Start-AutopilotOOBE
+:: There are multiple example lines. Make sure only one is uncommented
+:: The next line assumes that you have a configuration saved in C:\ProgramData\OSDeploy\OSDeploy.AutopilotOOBE.json
+start "Start-AutopilotOOBE" PowerShell -NoL -C Start-AutopilotOOBE
+
+exit
+'@
+    $SetCommand | Out-File -FilePath "C:\Windows\Autopilot.cmd" -Encoding ascii -Force
+    Write-Host -ForegroundColor Green "[+] C:\Windows\Autopilot.cmd created"
 }
 #endregion
 #=================================================
